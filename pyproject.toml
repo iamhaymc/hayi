@@ -1,0 +1,22 @@
+[project]
+name = "agent"
+version = "0.1.0"
+description = "An application agnostic agent harness library"
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "openai-agents",
+    "jinja2",
+    "websockets",
+    "cachetools",
+]
+
+[project.scripts]
+agent = "agent:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["agent.py", "agent_page.html", "agent_page.css", "agent_page.js"]

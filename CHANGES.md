@@ -1,0 +1,409 @@
+# agent — Changes
+
+The record of what has been built and why it is built that way: the constraints
+the harness was designed against, the reasoning behind each subsystem, and the
+defects that were worth understanding rather than merely patching. It is written
+for whoever picks the library up next, so an entry is kept while it explains a
+decision that is still load-bearing and dropped when the code has stopped
+depending on it.
+
+Three other files carry the rest. [`README.md`](README.md) is the short version —
+what the harness is and how to install, run and test it. [`GUIDE.md`](GUIDE.md)
+is the walkthrough of the implementation, subsystem by subsystem, with the
+configuration, protocol and extension reference. [`TODO.md`](TODO.md) is what is
+left, in one flat list.
+
+There are no releases yet, so this is grouped by subsystem rather than by
+version, with the phase log and the fixes at the end.
+
+---
+
+## Constraints and design intent
+
+### Goals
+
+- **Application agnostic.** The harness knows nothing about any product built on
+  it. A consumer owns a prompt template and, at most, a subclass; everything
+  else is configuration.
+- **One class is the API.** `Agent` resolves its own configuration, renders the
+  template, runs the agentic loop and streams the result. `await Agent().run(t)`
+  is a complete program.
+- **The loop is usable alone.** The batteries are additive, not structural:
+  `Engine` is the inference and tool call loop with no storage, sessions,
+  memory, repository, console or web, and `Agent` is that class with those
+  bolted on. An application that already has its own infrastructure embeds
+  `Engine` and pays for nothing else.
+- **Everything is replaceable.** Every subsystem is either an injectable
+  collaborator (`store=`, `cache=`, `tools=`, …), an overridable method
+  (`build_model`, `build_prompt`, `stream`, …) or a registry entry (tools,
+  commands, event subscribers). No behaviour is reachable only by patching.
+- **A run leaves no trace.** Work happens inside a session that owns a temporary
+  directory; closing or expiring the session removes the directory, its database
+  record and its cache entry.
+- **One implementation, three front ends.** The same `Agent` drives the console,
+  the CLI and the web UI, because printing and streaming are event subscribers
+  rather than code paths inside the loop.
+- **Secrets never leak.** Credentials are masked in every serialization, banner
+  and command output, and are never written to disk.
+
+### Non-goals
+
+- A framework. There is no plugin discovery, no dependency injection container
+  and no configuration DSL: a dataclass, an event bus and two registries.
+- A hosted product. There is no user model and no multi-tenancy; conversations
+  are remembered per session, not per person, and the harness is a library
+  first.
+- A model abstraction layer. The `openai-agents` SDK is the loop; the harness
+  supplies configuration, tools, sessions and transport around it.
+
+### Constraints that shaped the code
+
+- **Chat Completions backends only.** The hosted tools of `openai-agents`
+  (`ApplyPatchTool`, `ShellTool`, …) require the OpenAI Responses API.
+  OpenRouter and most other providers speak Chat Completions, which supports
+  plain function tools only — so the file, shell, image and patch tools are
+  implemented here rather than taken from the SDK.
+- **Async end to end.** The web layer, the SDK stream and the tools all live on
+  one event loop, so every blocking primitive (file IO, `git`, subprocesses)
+  either runs in a thread or uses an async subprocess.
+- **A single flat module.** `agent.py` is one file with commented subsystem
+  sections. It keeps the import graph trivial, the library copyable into another
+  tree and the whole surface readable in one pass.
+
+---
+
+## Configuration
+
+`AgentConfig` is a dataclass resolved in layers: dataclass defaults, then
+`AGENT_*` environment variables, then whatever the consumer or the CLI passes
+in. Layering in that order is what lets the same object serve a library caller,
+a shell and a deployment without any of them knowing about the others.
+
+Values are coerced from the environment against the field annotations, so
+`AGENT_PORT` becomes an `int` and `AGENT_THEME` a `Path` without a schema.
+Unknown keys are not errors: they land in `extras` and are reachable from a
+template as `config.<name>`, which is how an application adds its own values
+without subclassing the config.
+
+`input` is deliberately overloaded. A caller passes a file path or raw text and
+the harness decides: short single-line values that name an existing file are
+read, everything else is used as is. That is the whole reason the CLI needs only
+`--input`.
+
+Secrets are recognized by field name (`*_api_key`, `*_token`, `*secret*`, …) and
+masked by `to_dict()` and by the console banner, so a config can be logged,
+served over the REST API or printed without redacting it by hand at each site.
+
+## Events
+
+Every observable side effect of a run — printing, streaming to the browser,
+logging — is a subscriber on `EventBus` rather than a branch inside the loop.
+This is what makes the console renderer deletable (`console=False`), the web
+server a pure bridge and telemetry a three-line addition.
+
+A failing subscriber is caught and reported, never propagated: a broken renderer
+must not be able to kill a run. Handlers may be sync or async, so the bus is
+usable from a thread-shaped consumer without wrapping.
+
+Tool calls are part of that stream rather than a hint that something happened.
+`tool.start` once carried nothing but `kind`, so a console or a browser could
+show that the model had paused without ever showing what it ran; the loop now
+publishes the tool name, the arguments, the outcome, the result and the duration,
+and keeps the same records on `RunResult.tools` for a caller that audits a run
+afterwards. The arguments come from the run item events of the SDK instead of the
+raw argument deltas, because that is where a complete, already assembled call and
+its matching output are available. Everything published is passed through
+`redact()` first: a run is worth watching only if watching it cannot leak the
+credentials the model was handed, and a transcript is worth keeping only if one
+tool that returns a megabyte cannot flood it.
+
+## Prompt
+
+The consumer owns the template; the harness only renders it. Jinja runs
+sandboxed with `StrictUndefined`, so a typo in a template fails loudly instead of
+silently emitting an empty prompt, and a template cannot reach into the host
+process. `config` is the single object exposed to the template, which keeps the
+contract between application and harness to one name.
+
+## Storage and cache
+
+`Store` and `Cache` are protocols with a SQLite and an in-memory LRU
+implementation. The split exists because the two have different lifetimes: the
+store is durable and namespaced (sessions today, transcripts tomorrow), the
+cache is a bounded, optionally expiring accelerator. Both are constructor
+arguments, so Redis or Postgres is a substitution and not a fork.
+
+## Sessions
+
+A session owns a temporary directory and every tool is scoped to it. Isolation
+is the point: concurrent runs cannot see each other's files, and a crash cannot
+leave content behind on the host. Expiry is checked on access and on every run,
+so an abandoned browser tab cannot pin a workspace forever; `keep_workspace` is
+the escape hatch for debugging.
+
+`workspace_seed` copies an application content directory into each new workspace,
+which is how a consumer ships data to the model without teaching the harness
+about it.
+
+Sessions used to live only in a process dictionary, so a restart orphaned every
+workspace and forgot every id while the store still held the record. Three
+changes closed that gap:
+
+- **The store is the source of truth.** A manager rehydrates the live sessions
+  from the store when it is built, and a record that cannot be read, has expired
+  or has lost its directory is reconciled away rather than adopted — a restart
+  either returns the same session or none at all, never a broken one.
+- **Nothing is left behind.** The directories under the workspace root that no
+  live session owns are reaped, restricted to a configured root and to the
+  manager's own prefix so a shared temporary directory can never be swept up by
+  it.
+- **Expiry on a timer, a lease on access.** `session_sweep_interval` runs
+  expiry and reaping in the background instead of waiting for someone to ask for
+  a session, and access renews the lease so a busy session is not expired under
+  a client while an abandoned one still runs out.
+
+Durability is opt-in (`session_durable`) because the default promise of the
+harness is that a crash leaves no content on the host: with it set a shutdown
+keeps the workspaces and their records, without it a shutdown still wipes them.
+
+## Memory
+
+A run used to be one shot: the prompt was rendered, the loop ran, the blocks were
+streamed and nothing survived. That was defensible for the CLI and a lie in the
+chat UI, where a second message started from zero. A session now owns a
+transcript.
+
+Three decisions shaped it:
+
+- **The store, not the process.** Transcripts are persisted through the same
+  namespaced `Store` as sessions, so they outlive a reconnect and can outlive a
+  restart; the in-process dictionary is only a read-through cache.
+- **What is remembered is the exchange, not the prompt.** Replaying the rendered
+  template on every turn would repeat the consumer's instructions verbatim and
+  spend the context window on them, so the default records the input the user
+  wrote and the output of the model. `Agent.remember()` is the hook for a
+  consumer that wants another rule, and a failed or empty run is not recorded at
+  all so an error cannot poison the next turn.
+- **A budget with a fallback, not a token count.** Trimming is by turn count and
+  character count because the harness talks to many providers and has no
+  trustworthy tokenizer for them; both budgets are configurable, `0` disables
+  either, and the newest turn always survives so a small budget cannot erase the
+  conversation. When `memory_summary` is set, what falls out is compressed by the
+  `summary` model role (falling back to the leader) into one system turn instead
+  of being dropped — opt-in, because it costs a model call, and best effort,
+  because a failing summarizer must cost the summary rather than the run.
+
+The web layer replays the transcript in the `hello` reply, which is what makes a
+reload or a reconnect restore the discussion instead of showing an empty page
+attached to a model that remembers. `/forget` clears a transcript, and closing a
+session forgets it along with its workspace.
+
+## Models
+
+A run has one **leader** model that drives the agentic loop and, optionally,
+specialists that tools delegate to. The first specialist is **vision**, added
+because the strongest text leaders are frequently blind: with `vision_model`
+unset the leader is assumed multimodal and gets `view_image`, which returns a
+base64 data URL; with it set the leader gets `describe_image` instead and the
+image never enters its context — the specialist answers in a single completion,
+without tools and without a loop, and only its text comes back.
+
+`ModelSpec` is the resolved identity of a role and `ModelPool` keeps one client
+per endpoint and one SDK model per name, shared across roles, sessions and runs,
+so an additional role costs no additional connection. Specialist endpoints and
+credentials fall back to the leader's, which makes a second model on the same
+provider a single setting. Adding a role is therefore three steps: add the
+fields, resolve with `config.model_spec(role)`, call the pool.
+
+## Tools
+
+`Workspace` holds the sandboxed primitives and `ToolRegistry` exposes them to the
+model. Keeping them apart means the security-critical part — path resolution,
+size limits, shell timeouts — is plain synchronous code that can be unit tested
+without an SDK, a model or a network.
+
+Paths are resolved through `Path.resolve()` and rejected unless they stay inside
+the root, which also settles symlinks: a link pointing outside the workspace
+resolves outside it and is refused. Reads are capped, empty files are rejected
+before they become malformed data URLs, and shell commands run with an explicit
+timeout and are killed when they exceed it, because an unbounded subprocess is
+an unbounded hang of the whole event loop.
+
+Every tool is wrapped by one shared guard that turns workspace and repository
+errors into text the model can read and act on. A tool that raises ends the run;
+a tool that returns `Error: …` lets the model correct itself. The guard preserves
+the wrapped signature, since the SDK derives the tool schema from it.
+
+## Repository
+
+A session may be backed by a git checkout, which turns the harness from a text
+generator into something that can finish a piece of work. Setting `repo_url` is
+enough: on first use the repository is cloned into the session workspace and a
+branch of its own (`<prefix>/<session id>`) is checked out from the base branch.
+
+The clone is an ordinary directory inside the workspace, so every existing file
+and shell tool already works on it and it is wiped with the session — no second
+sandbox, no second path model. `RepoSpec` normalizes `owner/name`, HTTPS, SSH and
+filesystem URLs onto one identity so the same configuration works against
+github.com, an Enterprise host and a local fixture (which is what makes the git
+tests hermetic).
+
+Credential handling is the delicate part and is deliberately narrow: the token is
+embedded only in the argument list of the git invocations that need it, the
+stored remote is rewritten to the clean URL immediately after cloning, and every
+command output and API error is masked before it is surfaced. Tokens shorter
+than eight characters are not masked, because replacing a one-character string
+would shred unrelated output without protecting anything.
+
+A clone failure is reported and the run continues without a checkout: a
+repository is an enhancement of a session, never a precondition for it.
+
+The five git tools (`git_status`, `git_commit`, `git_push`, `open_pull_request`,
+`publish_work`) exist as one set with a matching set of slash commands so that a
+human and a model drive the same operations through the same code.
+
+## Core
+
+The core was one class until an embedding consumer needed the loop without the
+harness: `Agent.__init__` opened a SQLite database and a session manager (and so
+a temporary directory) before it could run anything, which is exactly what an
+application with its own sessions and history does not want. Splitting it was
+cheaper than making each battery optional — `Engine` holds the pieces the loop
+genuinely needs (config, events, prompts, tools, models) and `Agent` adds the
+rest, so neither class carries a flag for the other's behaviour.
+
+Two extractions made the split clean. `running()` is an async context manager
+around the body of a run, so the `agent.start` / `agent.error` / `agent.end`
+lifecycle and the "report failures on the result, re-raise cancellation" rule
+are written once and shared by both `run()` methods. `turn()` is one pass of the
+loop (workspace, tools, SDK agent, stream), so `Agent.run()` differs from
+`Engine.run()` only where it should: acquiring a session, rendering a template
+and replaying what the session remembers. `stream()` lost its `Session` argument
+in the process — it now takes the `RunResult`, whose `session_id` is only a
+correlation id, which is what let the loop stop knowing about sessions at all.
+
+## Console
+
+The default renderer is only a subscriber. It prints a banner from
+`config.banner_items()`, streams blocks with per-kind styling, and disables
+colour when the stream is not a TTY. Consumers subclass it, replace it or drop it
+and subscribe their own; nothing in the loop knows it exists.
+
+## Commands
+
+Slash commands power everything the discussion itself does not: session
+lifecycle, model and vision switching, and every git operation. One registry
+serves both the CLI and the browser, so a command written once is available in
+both, and the client discovers the list at handshake time instead of hard coding
+it.
+
+## Web layer
+
+REST is read-only state (`/api/health`, `/api/config`, `/api/commands`,
+`/api/sessions`, `/api/theme`); everything that changes state travels over the
+websocket. One ordered channel per client removes the interleaving problem
+between a POST and a stream, and makes cancellation a message rather than a
+second endpoint with its own auth story.
+
+Connections subscribe to the channel of their session, and the server is a pure
+bridge: it subscribes to the bus, filters events to JSON-safe values and
+broadcasts them. `agent.start` is not forwarded, since it carries the resolved
+config object.
+
+Attachments are uploaded as data URLs on the prompt message, size-capped, stored
+under `attachments/` in the session workspace with sanitized names, and appended
+to the prompt as a file listing — so an attachment is just a workspace file the
+model can open with the tools it already has.
+
+## Web client
+
+Blocks are content subscribers, not a transcript: a block is created on first
+sight of its id and may be updated concurrently and out of order, which is what
+allows reasoning, output and tool activity to stream in parallel without the page
+having to model turn order.
+
+Markdown is rendered from fully escaped text, so untrusted model output cannot
+inject HTML, and URLs are allow-listed (`http(s)`, `mailto`, relative paths and
+`data:` for media only) before they become links or players. Images, video and
+audio are recognized by extension or data URL and rendered inline.
+
+The UI is mobile first, centred, and shrinks content before wrapping it. It
+disables itself while disconnected and reconnects with exponential backoff, so a
+dropped socket degrades visibly instead of silently swallowing input. Theming
+reads a subset of the VS Code theme spec and maps it onto CSS custom properties,
+which gives the whole UI a palette from a file the user already has.
+
+## Consumer port: storynu
+
+`utils/storynu` was rewritten onto the harness to prove the boundary: it owns
+`story_prompt.md` (a Jinja template that injects `config.input`) and `story.py`,
+which sets the model, the instructions, story specific config values and an
+exporter that copies the finished story out of the session workspace. Everything
+else it used to carry — argument parsing, streaming, tools, sandboxing — is the
+harness.
+
+---
+
+## Phase log
+
+1. Flat package scaffold: `pyproject.toml`, the subsystem layout of `agent.py`
+   and the placeholder page assets.
+2. Config subsystem: `AgentConfig` with layered resolution, input resolution,
+   secret masking and validation.
+3. Event subsystem: typed `Event`/`EventBus` with sync and async subscribers.
+4. Prompt subsystem: sandboxed, strict Jinja rendering of a consumer template.
+5. Storage subsystem: `Store` + `SqliteStore` and `Cache` + `LruCache`.
+6. Session subsystem: isolated workspaces, expiry and guaranteed cleanup.
+7. Tool subsystem: workspace scoped file/shell/image/patch tools and a registry.
+8. Core `Agent`: construction from config, `run()`, block streaming,
+   cancellation and overridable hooks.
+9. Console renderer: banner and block aware streaming printer, as a subscriber.
+10. CLI layer: `main()` with only `--input` and `--serve`.
+11. Web layer: REST plus a websocket hub bridging block events to clients.
+12. Web client: chat UI with out-of-order blocks, markdown and media preview,
+    attachments, connection state and a mobile first layout.
+13. Slash commands: one registry shared by the CLI and the UI.
+14. VS Code theme support mapped onto CSS custom properties.
+15. Unit tests over config, prompts, events, storage, cache, sessions, tool path
+    scoping, command parsing and the protocol codec.
+16. Ported `storynu` onto the harness.
+17. Fixed the defects found while porting (below).
+18. `README.md`: overview, subsystem map, extension points and usage.
+19. Multi-model support: `ModelSpec`/`ModelPool` and the vision specialist.
+20. Repository support: `repo_*` config, `RepoSpec`/`RepoManager`/`Checkout`,
+    session branches, the five git tools and the matching slash commands.
+21. Documentation split: this file, [`GUIDE.md`](GUIDE.md), a README reduced to
+    a summary and a quickstart, and a TODO of what is still open.
+22. Conversation memory: `Turn`/`Transcript`/`ConversationMemory`, replay into
+    the model and into the client, budgeted trimming with optional summarising,
+    and `/forget`.
+23. Durable sessions: rehydration from the store, reconciliation and reaping of
+    unowned workspaces, a background expiry sweeper and `session_durable`.
+24. Embeddable core: the loop split out as `Engine` (config, events, prompts,
+    tools, models) with `Agent` subclassing it for the batteries, a shared
+    `running()` lifecycle and `turn()`, model input taken verbatim, tools from
+    the caller or from an optional workspace, and `env=False` for hosts that do
+    not want the `AGENT_*` environment read.
+
+## Fixes worth remembering
+
+- **Hard coded credentials.** The pre-harness code carried an API key in the
+  source. Credentials are now config fields, recognized by name and masked
+  everywhere they are serialized.
+- **Blocking IO on the event loop.** File reads, writes and subprocesses ran
+  inline in async tools and stalled streaming. Synchronous primitives now run in
+  a thread and shells use `asyncio` subprocesses.
+- **Unbounded shells.** A command with no timeout hung the loop with no way back.
+  Shell execution has an explicit timeout, kills the process on expiry and
+  reports it as text.
+- **Path handling duplicated per tool.** Each tool resolved and validated its own
+  paths, so escapes depended on which tool was called. `Workspace.resolve()` is
+  now the only path gate.
+- **Output paths escaping the sandbox.** Results were written wherever the caller
+  asked; export is now an explicit consumer step out of the session workspace.
+- **Tool errors ending runs.** Exceptions from tools aborted the loop instead of
+  informing the model. One shared guard turns them into `Error: …` text, and it
+  is shared by the file and repository tools so both behave identically.
+- **Tokens reaching disk.** An authenticated clone URL persists in `.git/config`
+  by default; the remote is rewritten to the clean URL right after cloning and
+  all git output is masked.

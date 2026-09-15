@@ -1,0 +1,564 @@
+# agent — Guide
+
+A walkthrough of the implementation. It follows the module from the outside in:
+the shape of a run first, then each subsystem in the order `agent.py` declares
+them, then the reference tables (configuration, tools, protocol) and the
+extension points.
+
+[`README.md`](README.md) is the summary and the quickstart, [`CHANGES.md`](CHANGES.md)
+is what has been built and why, and [`TODO.md`](TODO.md) is what is left.
+
+---
+
+## 1. Layout
+
+| File              | Contents                                        |
+| ----------------- | ----------------------------------------------- |
+| `agent.py`        | The library: every subsystem and the CLI        |
+| `agent_test.py`   | Unit tests                                      |
+| `agent_page.html` | Chat page markup                                |
+| `agent_page.css`  | Mobile first, theme driven styles               |
+| `agent_page.js`   | Client: blocks, markdown, media, commands, hub  |
+| `pyproject.toml`  | Package metadata, dependencies, `agent` script  |
+
+`agent.py` is a single flat module divided by commented section banners, in this
+order: **config, events, prompt, storage, sessions, memory, repository, models,
+tools, console, commands, core, web, cli**. Each section is self-contained and depends
+only on the ones above it, so the file reads top to bottom.
+
+Dependencies: `openai` and `openai-agents` (the loop), `jinja2` (templates),
+`websockets` (transport), `cachetools` (LRU). Python 3.12 or newer.
+
+## 2. Two entry points
+
+The core is split in two classes so the loop can be used without the harness
+around it.
+
+`Engine` is the loop: a config, an event bus, a prompt renderer, a tool registry
+and a model pool, and nothing else. `Engine.run(model_input, ...)` takes the
+model input verbatim — a prompt string or the chat messages the caller assembled
+from its own history — builds the tools (the ones passed in, or the built-in set
+for a workspace, or none), builds the SDK agent and streams it, publishing the
+same `agent.*`, `block.*` and `tool.*` events and returning the same
+`RunResult`. It creates no database, no session, no workspace and no console, so
+an application that already has that infrastructure embeds it directly and pays
+for nothing it does not use. `env=False` also keeps the `AGENT_*` environment out
+of the resolved config.
+
+`Agent` subclasses `Engine` and adds the batteries: storage, sessions and their
+workspaces, conversation memory, git checkouts, slash commands, the console
+renderer and the web layer. Both share `resolve_config`, `build_model`,
+`build_vision`, `build_tools`, `build_sdk_agent`, `turn`, `stream` and the
+`running()` lifecycle, so an override or an injected collaborator behaves the
+same in either.
+
+## 3. The shape of a run
+
+`Agent.run(template, **overrides)` is the whole story:
+
+1. **Resolve the config.** `resolve_config()` merges overrides onto the instance
+   config and turns `input` (a file path or raw text) into `config.input`.
+2. **Acquire a session.** Expired sessions are purged, then an existing session
+   is reused or a new workspace is created.
+3. **Prepare the session.** If a repository is configured it is cloned into the
+   workspace on a session branch (idempotent, and never fatal).
+4. **Publish `agent.start`.** Subscribers (console, web) react.
+5. **Render the prompt.** `build_prompt()` renders the template against the
+   config, then `decorate_prompt()` appends the attachment listing.
+6. **Build the tools.** A `Workspace` is scoped to the session directory and the
+   registry builds the tool list for it, including the git tools when the
+   session has a checkout.
+7. **Build the SDK agent** with the leader model, the instructions and the tools.
+8. **Build the model input.** `build_input()` prepends what the session
+   remembers, so the prompt is the newest message of a conversation rather than
+   a one shot request.
+9. **Stream.** `stream()` consumes the SDK event stream and republishes it as
+   `block.*` and `tool.*` events.
+10. **Remember.** `remember()` appends the exchange to the transcript of the
+    session, trimming (or summarising) it back inside its budget.
+11. **Finish.** `agent.end` (or `agent.error`) is published and a `RunResult` is
+    returned; cancellation is re-raised after being recorded.
+
+Failures inside the loop are captured on the result rather than raised, so a
+caller always gets a `RunResult` and can branch on `result.ok`.
+
+## 4. Config
+
+`AgentConfig` is a dataclass with three composition methods:
+
+- `merge(**overrides)` — copy with non-`None` overrides applied; unknown keys go
+  to `extras`.
+- `with_env(environ)` — copy with `AGENT_<FIELD>` overrides applied, coerced to
+  the annotated type (`int`, `float`, `bool`, `Path`, `str`).
+- `model_spec(role)` — resolve a role to a `ModelSpec`, or `None`.
+
+`__getattr__` falls back to `extras`, so `config.genre` works in a template when
+`genre` was passed as an override. `to_dict(redact=True)` masks anything
+`is_secret_key()` recognizes, and `banner_items()` is the console summary.
+
+Resolution order is **defaults → environment → explicit arguments**, applied in
+`Agent.__init__` (`AgentConfig().with_env().merge(**overrides)`) and again per
+run in `resolve_config()`.
+
+### Configuration reference
+
+| Variable / field                                            | Meaning                                     |
+| ----------------------------------------------------------- | ------------------------------------------- |
+| `AGENT_NAME`, `AGENT_INSTRUCTIONS`                          | Agent name and system instructions          |
+| `AGENT_MODEL`, `AGENT_API_URL`, `AGENT_API_KEY`             | Leader model, endpoint and credential       |
+| `AGENT_MAX_TURNS`                                           | Maximum agentic turns per run               |
+| `AGENT_VISION_MODEL`                                        | Vision specialist (unset: the leader sees)  |
+| `AGENT_VISION_API_URL`, `AGENT_VISION_API_KEY`              | Vision endpoint (defaults to the leader's)  |
+| `AGENT_VISION_INSTRUCTIONS`, `AGENT_VISION_MAX_TOKENS`      | Vision system prompt and answer budget      |
+| `AGENT_MEMORY_ENABLED`                                      | Remember the conversation of a session      |
+| `AGENT_MEMORY_MAX_TURNS`, `AGENT_MEMORY_MAX_CHARS`          | Memory budget (`0` disables a limit)        |
+| `AGENT_MEMORY_SUMMARY`                                      | Summarise trimmed turns instead of dropping |
+| `AGENT_SUMMARY_MODEL`, `AGENT_SUMMARY_API_URL`, `AGENT_SUMMARY_API_KEY` | Summary role (defaults to the leader) |
+| `AGENT_SUMMARY_INSTRUCTIONS`, `AGENT_SUMMARY_MAX_TOKENS`    | Summary system prompt and answer budget     |
+| `AGENT_INPUT_SOURCE`                                        | Input path or text (also `--input`)         |
+| `AGENT_WORKSPACE_ROOT`, `AGENT_WORKSPACE_SEED`              | Parent of workspaces; directory copied in   |
+| `AGENT_SESSION_TTL`, `AGENT_KEEP_WORKSPACE`                 | Session lifetime; keep the directory        |
+| `AGENT_SESSION_DURABLE`, `AGENT_SESSION_SWEEP_INTERVAL`      | Survive a restart; expiry sweep period      |
+| `AGENT_REPO_URL`, `AGENT_REPO_BRANCH`, `AGENT_REPO_TOKEN`   | Default repository, base branch, credential |
+| `AGENT_REPO_REMOTE`, `AGENT_REPO_BRANCH_PREFIX`, `AGENT_REPO_DIR` | Remote name, branch prefix, clone dir |
+| `AGENT_REPO_AUTHOR_NAME`, `AGENT_REPO_AUTHOR_EMAIL`         | Identity the harness commits with           |
+| `AGENT_REPO_DEPTH`, `AGENT_REPO_CLONE`, `AGENT_REPO_TIMEOUT`| Clone depth, auto clone, git timeout        |
+| `AGENT_DB_PATH`, `AGENT_CACHE_SIZE`                         | SQLite file and LRU capacity                |
+| `AGENT_SHELL_TIMEOUT`, `AGENT_SHELL_ENABLED`                | Shell tool limits                           |
+| `AGENT_HOST`, `AGENT_PORT`, `AGENT_THEME`                   | Web bind address and UI theme file          |
+| `AGENT_QUIET`, `AGENT_COLOR`                                | Console output                              |
+| `AGENT_TEMPLATE`                                            | Template path or raw template for `main()`  |
+
+Anything not listed is an extra: pass it as a constructor override and read it in
+the template as `config.<name>`.
+
+## 5. Events
+
+`EventBus.publish(type, session_id=..., **data)` builds an `Event` and delivers
+it to the subscribers of that type plus the subscribers of `EventType.ALL`.
+Handlers may be sync or async; exceptions are printed to stderr and swallowed.
+`on()` returns an unsubscriber.
+
+| Event                          | Payload                                    |
+| ------------------------------ | ------------------------------------------ |
+| `agent.start`                  | `config` (never forwarded to the web)      |
+| `agent.end`                    | `output`, `error`, `config`                |
+| `agent.error`                  | `error`                                    |
+| `block.start`                  | `id`, `kind`, `role`                       |
+| `block.delta`                  | `id`, `kind`, `text` (the delta)           |
+| `block.end`                    | `id`, `kind`, `text` (the full block)      |
+| `tool.start`                   | `id`, `kind`, `name`, `call_id`, `arguments`, `text` |
+| `tool.end`                     | the above plus `ok`, `result`, `duration`  |
+| `session.open`, `session.close`| `kind`, `repo`                             |
+| `log`                          | `kind`, `message`                          |
+
+## 6. Prompt
+
+`PromptRenderer` wraps a Jinja `SandboxedEnvironment` with `StrictUndefined` and
+`autoescape=False` (the output is a prompt, not HTML). `render(template, config,
+**context)` exposes the config as `config` and any context keys by name;
+`render_file(path, ...)` reads a template from disk. Output is stripped.
+
+`Agent.decorate_prompt()` appends an `## Attached files` listing when the run
+carries attachments, unless the template already contains that heading.
+
+## 7. Storage and cache
+
+`Store` is a namespaced key/value protocol (`get`, `set`, `delete`, `list`,
+`close`) with two implementations: `MemoryStore` for tests and `SqliteStore`,
+which keeps JSON values in a `store(namespace, key, value, updated_at)` table
+and falls back to an in-memory database when no path is given.
+
+`Cache` is `get`/`set`/`delete`/`clear`, implemented by `LruCache` over
+`cachetools` with an optional TTL. Sessions are written to both.
+
+## 8. Sessions
+
+`Session` is `id`, `workspace`, `created_at`, `expires_at` and free-form `meta`
+(the git checkout lives under `meta["repo"]`). `SessionManager`:
+
+- `create(**meta)` — a 12 hex character id, a `mkdtemp` workspace under
+  `workspace_root`, optionally seeded from `workspace_seed`, persisted to the
+  store and the cache.
+- `get(id)` — returns the session, closing it first if it has expired and
+  renewing its lease otherwise, so an active session is never expired under a
+  client and an idle one still runs out.
+- `ensure(id)` — get or create.
+- `update(session)` — re-persist after mutating `meta`.
+- `list()`, `close(id)`, `purge_expired()`, `close_all(destroy=None)`.
+
+`_destroy()` removes the directory (unless `keep_workspace`), the store record
+and the cache entry. `_persist()` and `_destroy()` are the hooks to override for
+a different lifecycle.
+
+### Durability
+
+The store record of a live session is what makes a session outlive its process:
+
+- `restore()` — called on construction, it rehydrates the sessions the store
+  still holds. A record that cannot be read, whose lease has run out or whose
+  directory is gone is reconciled away (`_destroy()`) instead of adopted, so a
+  restart never hands out a session without a workspace.
+- `orphans()` / `reap_orphans()` — directories under `workspace_root` named
+  `<prefix>-*` that no live session owns. Only a configured root is scanned and
+  only directories this manager could have created, so a shared temporary
+  directory is never touched; `keep_workspace` reaps nothing.
+- `sweep()` — `purge_expired()` plus `reap_orphans()`.
+- `start_sweeper()` / `stop_sweeper()` — run `sweep()` every
+  `session_sweep_interval` seconds (`0` disables the timer) on the running loop.
+  `WebServer.serve()` starts it and stops it with the server, and
+  `Agent.aclose()` stops it too. A failing sweep is reported, not fatal.
+
+`session_durable` decides what a shutdown means: by default `close_all()`
+destroys every workspace, and with it set the manager only forgets them so the
+next start rehydrates the same sessions (workspaces, `meta["repo"]` checkouts
+and transcripts included). Pass `close_all(destroy=True)` to wipe them anyway.
+
+## 9. Memory
+
+A session remembers its conversation. `Turn` is one message (`role`, `text`,
+`created_at`, plus the block `kind` its role maps onto), `Transcript` is the
+ordered turns of one session (`append`, `messages`, `size`, `overflow`) and
+`ConversationMemory` owns them:
+
+- `transcript(session_id)` — load once from the store, then keep in memory.
+- `history(session_id)` — the turns as chat messages for the model.
+- `replay(session_id)` — the turns as JSON for a client that (re)connects.
+- `remember(session_id, turns)` — append, `trim`, persist.
+- `trim(transcript)` — drop the oldest turns until `max_turns` and `max_chars`
+  are met; when a `summarizer` is set, what falls out is folded into a single
+  `system` turn instead. The newest turn always survives, and a failing
+  summarizer costs the summary rather than the run.
+- `forget(session_id)` — erase it, in memory and in the store.
+
+On the `Agent` side, `build_input()` returns the prompt alone when nothing is
+remembered (a one shot run) and `[*history, {"role": "user", …}]` otherwise, and
+`remember()` decides what is kept: by default the input the user wrote (not the
+rendered template, which would be replayed verbatim every turn) and the output
+of the model, and only for a run that succeeded with output. Override
+`remember()` to remember more, less or something else; inject
+`memory=ConversationMemory(...)` or subclass it for another policy;
+`memory_enabled=False` turns the whole subsystem off.
+
+Summarising is opt-in: `memory_summary` makes `build_summarizer()` return a
+delegate over the `summary` role, which falls back to the leader model when
+`summary_model` is unset. `/forget` clears a transcript, and `/new` and `/end`
+forget the session they close.
+
+## 10. Repository
+
+Three types:
+
+- **`RepoSpec`** — a frozen, addressable repository. `from_config()` builds it
+  from the `repo_*` fields. `parts` normalizes `owner/name`, `https://…`,
+  `git@host:owner/name.git` and filesystem paths into `(host, slug)`;
+  `clone_url` is credential-free; `api_url` is `https://api.github.com` or
+  `https://<host>/api/v3`; `authenticated_url()` embeds the token for a single
+  invocation; `mask()` strips the token from text (tokens under 8 characters are
+  left alone); `identity()` returns the `git -c user.*` arguments.
+- **`RepoManager`** — runs git and talks to the forge. `git(*args, cwd=…)` uses
+  an async subprocess with `GIT_TERMINAL_PROMPT=0`, a timeout and masked output.
+  `clone()` clones (optionally shallow, optionally at a base branch), rewrites
+  the remote to the clean URL, records the base branch and checks out
+  `<prefix>/<session id>`. `status()` is `git status --short --branch`;
+  `commit()` stages everything, refuses an empty message or an empty index, and
+  commits under the configured identity; `push()` pushes `HEAD:refs/heads/<branch>`
+  to the authenticated URL; `open_pull_request()` POSTs to
+  `/repos/<slug>/pulls` with a bearer token and returns `number`, `url`, `title`
+  and `state`.
+- **`Checkout`** — the clone inside one session (`path`, `branch`, `base`,
+  `url`), serialized into `session.meta["repo"]`. It forwards `status`, `commit`,
+  `push` and `pull_request`, and `publish()` chains commit → push → pull request.
+
+`Agent.prepare_session()` performs the clone on first use, records it on the
+session and publishes `session.open`; a `RepoError` is logged and the session
+continues without a checkout. `Agent.checkout(session)` rebuilds a `Checkout`
+from the stored metadata.
+
+## 11. Models
+
+`ModelSpec` is `(role, name, api_url, api_key)` with `endpoint` as its identity.
+`ModelPool` caches one `AsyncOpenAI` client per endpoint and one
+`OpenAIChatCompletionsModel` per `(name, url, key)`, and offers two calls beyond
+the loop: `complete(spec, messages, max_tokens=…)` for a single completion and
+`describe_image(spec, data_url, question, …)`, which sends the system
+instructions plus a text/image message pair and returns the text answer.
+
+`Agent.build_model(config, role)` pulls from the pool, disables SDK tracing and
+sets the leader's client as the SDK default. `Agent.build_vision(config)` returns
+a `(data_url, question) -> text` delegate, or `None` when no vision model is
+configured — which is exactly what decides the image tool.
+
+## 12. Tools
+
+`Workspace` is the sandbox. `resolve()` rejects empty paths, strips quotes,
+anchors relative paths at the root and refuses anything that resolves outside it
+(which also blocks symlink escapes). On top of it: `read_text` (2 MiB cap),
+`write_text` (creates parents), `list_dir`, `read_data_url` (base64 with a
+guessed MIME type, empty files rejected), `apply_patch` (unified diff via
+`agents.apply_diff`, with `create_file` / `update_file` / `delete_file`) and
+`run_shell` (async subprocess, cwd at the root, killed on timeout, stdout +
+stderr + exit code returned as text).
+
+`ToolRegistry.build(workspace, vision=…, checkout=…)` assembles the list:
+
+| Tool                | Present when                | Effect                                    |
+| ------------------- | --------------------------- | ----------------------------------------- |
+| `list_directory`    | always                      | List a workspace directory                |
+| `read_text_file`    | always                      | Read a UTF-8 file                         |
+| `write_text_file`   | always                      | Write a file, creating parents            |
+| `apply_patch`       | always                      | Apply a unified diff                      |
+| `view_image`        | no vision model             | Return the image as a data URL            |
+| `describe_image`    | vision model configured     | Ask the specialist about the image        |
+| `run_shell_command` | `shell_enabled`             | Run a command in the workspace            |
+| `git_status`        | the session has a checkout  | Branch and working tree                   |
+| `git_commit`        | the session has a checkout  | Stage everything and commit               |
+| `git_push`          | the session has a checkout  | Push the session branch                   |
+| `open_pull_request` | the session has a checkout  | Open a pull request, return its URL       |
+| `publish_work`      | the session has a checkout  | Commit, push and open the pull request    |
+
+Registered factories (`registry.register(name, factory)`) are appended last and
+receive the `Workspace`. `ToolRegistry.guard` wraps every tool so `WorkspaceError`,
+`RepoError`, `OSError` and `ValueError` become `Error: …` text for the model,
+while `functools.wraps` preserves the signature the SDK turns into a schema.
+The hosted SDK tools are not used: they need the Responses API, and Chat
+Completions backends only support plain function tools.
+
+## 13. Console
+
+`ConsoleRenderer.attach(bus)` subscribes to `EventType.ALL`. It prints a banner,
+opens and closes blocks as they stream, styles them per kind (dim italic
+reasoning, dim tool, red error), prints every tool call as `-> name(args)` and
+its outcome as `<- name: ok in 12 ms` followed by the result, and disables colour
+when the stream is not a TTY
+or `AGENT_COLOR` says so. `write()`, `style()` and `banner()` are the override
+points; `Agent(console=False)` or `AGENT_QUIET=1` removes it entirely.
+
+## 14. Commands
+
+`CommandRegistry` maps a name to a description and a handler.
+`parse("/name args")` returns `(name, args)`, and `invoke(text, **context)`
+dispatches, awaiting async handlers. Handlers receive `args` plus the context the
+caller supplies (`session_id`, `connection`) and return a dict with at least
+`ok`; `session`, `sessions`, `commands` and `message` are understood by the
+client.
+
+| Command             | Effect                                            |
+| ------------------- | ------------------------------------------------- |
+| `/help`             | List the available commands                       |
+| `/new`              | Start a new session (cloning the repo if set)     |
+| `/end [id]`         | End a session and wipe its workspace              |
+| `/sessions`         | List live sessions                                |
+| `/use <id>`         | Switch to an existing session                     |
+| `/forget`           | Forget the conversation of the current session    |
+| `/model [name]`     | Show or set the leader model                      |
+| `/vision [name\|none]` | Show or set the vision specialist              |
+| `/repo [url\|none]` | Show, set or clear the default repository         |
+| `/clone`            | Clone the repository into the current session     |
+| `/status`           | Branch and working tree of the checkout           |
+| `/commit <message>` | Stage everything and commit                       |
+| `/push`             | Push the session branch                           |
+| `/pr <title>`       | Open a pull request (body on the following lines) |
+| `/publish <title>`  | Commit, push and open the pull request            |
+
+`/clear` and `/theme` are client-side only and never reach the server.
+
+## 15. Core
+
+`Block` is a chronological unit of content (`id`, `kind`, `role`, `text`),
+`ToolCall` is one tool invocation (`name`, `call_id`, redacted `arguments`,
+`result`, `ok`, `duration`, with `signature()`, `report()` and `to_dict()`) and
+`RunResult` collects the blocks, the tool calls, the rendered prompt, the final
+output and the error, with `ok` and `text_of(kind)`.
+
+`Engine.run()` is the loop on its own, `Agent.run()` is the loop inside a
+session; both wrap the body in `running()`, the async context manager that
+publishes `agent.start`, records a failure as `result.error` (re-raising only
+cancellation) and always publishes `agent.end`. `turn()` builds the workspace,
+the tools and the SDK agent for one pass and hands it to `stream()`.
+
+`Engine.stream()` consumes `Runner.run_streamed(...).stream_events()`, keeps only
+raw response events and maps them with `DELTA_KINDS`:
+`response.reasoning_summary_text.delta` and `response.reasoning_text.delta`
+become `reasoning`, `response.output_text.delta` becomes `output`. A change of
+kind closes the current block and opens the next, so block boundaries follow the
+model rather than the transport; `response.function_call_arguments.delta` only
+closes the block the model was writing.
+
+Tool calls arrive as run item events instead. `tool_called` opens a `tool` block
+and publishes `tool.start` with the tool name, the call id and the arguments
+parsed out of the JSON of the model; `tool_output` finds the call by its id
+(falling back to the oldest one still open), records the result and publishes
+`tool.end` with the outcome, the result and the duration. Both payloads carry a
+ready made `text` line, `ToolCall.report()`, for a renderer that does not want to
+format the fields itself. Every call is kept on `RunResult.tools`, so a finished
+run can be audited without subscribing to anything.
+
+`redact()` is applied to arguments and results before they leave the harness: a
+key that looks like a credential (`token`, `password`, `api_key`, … — the
+`SECRET_KEYS` list) becomes `[redacted]`, and any value longer than
+`Engine.TOOL_VALUE_LIMIT` (512 characters) is cut. Override `redact_arguments`,
+`tool_result_of` or `TOOL_VALUE_LIMIT` to change what a deployment publishes.
+
+`Engine.close()` clears the model pool; `Agent.close()` also wipes every
+workspace and clears the cache and the store; `aclose()` does it off the loop and
+both classes are async context managers.
+
+## 16. Web layer
+
+`WebServer` serves three things on one port: the page assets, a read-only REST
+surface and the websocket hub at `/ws`. It subscribes to the bus and forwards
+every event that carries a session id (except `agent.start`, which carries the
+config object) to the channel `session:<id>`, projecting the payload onto JSON
+safe values with `encode()`.
+
+`Hub` owns connections and channels: `join`, `leave`, `broadcast`, `send_all`
+and named message handlers registered with `on()`, plus the `connected` /
+`disconnected` lifecycle hooks. A `Connection` has an id, its channels, its
+current session and the task of the run it started, which is what `cancel`
+aborts; oversized, non-JSON and unknown messages are answered with an `error`
+rather than closing the socket.
+
+| Endpoint         | Response                                    |
+| ---------------- | ------------------------------------------- |
+| `GET /`          | `agent_page.html` (plus `.css`, `.js`)      |
+| `GET /api/health`| `{ok, name}`                                |
+| `GET /api/config`| The resolved config, secrets masked         |
+| `GET /api/commands` | The command list                         |
+| `GET /api/sessions` | Live sessions                            |
+| `GET /api/theme` | The server default theme variables          |
+
+| Message      | Direction | Fields                                      |
+| ------------ | --------- | ------------------------------------------- |
+| `ready`      | server    | `connection`                                |
+| `hello`      | both      | client: `session`; server: `session`, `config`, `commands`, `theme`, `history` |
+| `prompt`     | client    | `text`, `attachments[{name, type, data}]`   |
+| `command`    | client    | `text`                                      |
+| `cancel`     | client    | —                                           |
+| `ping`/`pong`| both      | —                                           |
+| `block.start`| server    | `id`, `kind`, `role`, `text`, `attachments`, `complete` |
+| `block.delta`| server    | `id`, `kind`, `text`                        |
+| `block.end`  | server    | `id`, `kind`                                |
+| `tool.start` | server    | `id`, `kind`, `name`, `call_id`, `arguments`, `text` |
+| `tool.end`   | server    | the above plus `ok`, `result`, `duration`   |
+| `agent.end`  | server    | `error?`                                    |
+| `agent.error`| server    | `error`                                     |
+| `command`    | server    | `command`, `result`                         |
+| `cancelled`  | server    | `ok`                                        |
+| `error`      | server    | `message`                                   |
+
+Attachments are decoded from their data URLs, capped (8 MiB per prompt, 16 MiB
+per websocket message), written under `attachments/` in the session workspace
+with sanitized names and passed to the run as `extras["attachments"]`.
+
+`load_vscode_theme()` maps a subset of the VS Code theme spec (`THEME_KEYS`)
+onto the CSS custom properties the page uses, and the result is served at
+`/api/theme` and sent in the `hello` message.
+
+## 17. Web client
+
+`agent_page.js` is six small subsystems over one socket:
+
+- **Markdown** — escapes the text first (`&`, `<`, `>`, `"`, `'`), then parses
+  headings, fences, quotes, rules and lists line by line and applies inline
+  code, emphasis, links and images. URLs are allow-listed (`http(s):`, `mailto:`,
+  relative paths, and `data:` for image/video/audio only), so model output can
+  never inject markup or a script URL.
+- **Media** — recognizes images, video and audio by extension or data URL and
+  emits `<img loading="lazy">`, `<video controls playsinline>` or
+  `<audio controls>`.
+- **Blocks** — `Blocks.ensure(id, kind, role)` creates a block on first sight and
+  returns it thereafter, so `block.delta` messages may arrive interleaved and out
+  of order. `append`, `set` and `end` re-render the body; the view auto-scrolls
+  only when the reader is already near the bottom. A `tool` block is labelled with the tool
+  name, rendered as text rather than markdown, and marked `data-status="failed"`
+  when the call did not succeed.
+- **Commands** — merges the server list from `hello` with the local `/clear` and
+  `/theme`, and drives the hint list (filter as you type, arrows to move,
+  Tab/Enter to select).
+- **Attachments** — files are read as data URLs, shown as removable chips and
+  sent with the next prompt.
+- **Socket** — connects to `/ws`, says `hello` with the current session, routes
+  server messages, and reconnects with exponential backoff (250 ms doubling to
+  8 s) while the composer disables itself and the status shows the state. The
+  `history` of the `hello` reply is replayed into the discussion, replacing what
+  is shown, so a reload or a reconnect restores the conversation.
+
+`agent_page.css` is mobile first: a `100dvh` grid of header, scrolling discussion
+and composer, centred at `52rem`, with every colour taken from a CSS custom
+property so a theme can replace the palette wholesale. Prompt blocks align right;
+tool and log blocks are monospaced and muted, a tool block keeps its whitespace
+and is labelled with the tool name (turning red when the call failed); a
+streaming block pulses.
+
+## 18. CLI
+
+`parse_args()` accepts exactly `--input` and `--serve`. `load_template()`
+resolves the template from `AGENT_TEMPLATE` (a path or raw text), then
+`./agent_prompt.md`, and finally falls back to passing the input through.
+`Agent.cli(template, argv)` constructs the agent and runs `execute()`, which
+either serves or performs one run and returns a process exit code, closing the
+agent either way.
+
+## 19. Extending
+
+Everything is a hook, an injectable collaborator or a registry entry. Start from
+`Engine` when the application owns its own sessions and history, and from
+`Agent` when it wants the batteries:
+
+```python
+engine = Engine(model="some/model", api_key=..., env=False)
+result = await engine.run(my_messages, tools=my_tools, session_id=my_id)
+```
+
+
+```python
+class MyAgent(Agent):
+    def resolve_config(self, config=None, **overrides):
+        return super().resolve_config(config, **overrides).merge(genre="noir")
+
+    def build_prompt(self, template, config, **context):
+        return super().build_prompt(template, config, **context) + "\nBe brief."
+
+agent = MyAgent(store=RedisStore(), cache=MyCache(), console=False)
+agent.events.on(EventType.BLOCK_DELTA, my_streamer)     # replace printing
+agent.tools.register("search", lambda ws: my_search_tool)
+agent.commands.register("mode", "Switch mode", my_handler)
+```
+
+Common overrides: `resolve_config`, `build_prompt`, `decorate_prompt`,
+`build_model`, `build_vision`, `build_summarizer`, `build_tools`,
+`build_sdk_agent`, `build_input`, `remember`, `turn`, `stream`, `prepare_session`,
+`register_default_commands`, `ConversationMemory.trim`, `ConsoleRenderer.write` /
+`.style`, `WebServer.encode` / `.rest` / `.register_handlers`, `Hub.connected`.
+
+Injectable collaborators: `events`, `renderer`, `prompts`, `tools`, `models`,
+`store`, `cache`, `sessions`, `memory`, `repos`, `commands`.
+
+Adding a model role: add `<role>_model` / `<role>_api_url` / `<role>_api_key`
+fields, resolve them with `config.model_spec(role)` and call
+`agent.models.model(spec)` or `agent.models.complete(spec, messages)`.
+
+## 20. Tests
+
+```
+python -m unittest agent_test -v
+```
+
+`agent_test.py` covers the embedded `Engine` path (no batteries, verbatim model
+input, supplied or workspace built tools, trapped failures), config layering and redaction, model specs and the pool,
+input resolution, the event bus, prompt rendering, both stores and the cache,
+session isolation and cleanup, session durability (rehydration,
+reconciliation, reaping and the sweeper), conversation memory (persistence,
+trimming, summarising, replay), workspace path scoping (including symlinks and
+shell timeouts), tool assembly (vision on and off, guarded errors), repository
+URL normalization, git operations against local fixture repositories, pull
+request posting against a stubbed forge, command parsing and the websocket
+protocol codec. No test needs a network or a model.
+
+## 21. Example consumer
+
+[`utils/storynu`](../storynu) owns only its content: `story_prompt.md`, a Jinja
+template that injects `config.input`, and `story.py`, which subclasses `Agent` to
+set the model, the instructions, story specific config values and an exporter
+that copies the finished story out of the session workspace.

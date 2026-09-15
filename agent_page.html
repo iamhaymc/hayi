@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en" data-theme-type="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Agent</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/agent_page.css" />
+  </head>
+  <body>
+    <div class="app" id="app" data-state="offline">
+      <header class="bar">
+        <span class="brand" id="brand">agent</span>
+        <span class="status" id="status" title="Connection status">
+          <i class="dot"></i><span id="status-text">connecting</span>
+        </span>
+        <span class="session" id="session" title="Active session"></span>
+      </header>
+
+      <main class="discussion" id="discussion" aria-live="polite">
+        <div class="empty" id="empty">
+          <p>Ask anything. Type <code>/help</code> for commands.</p>
+        </div>
+      </main>
+
+      <footer class="composer">
+        <div class="attachments" id="attachments" hidden></div>
+        <div class="hints" id="hints" hidden></div>
+        <form class="input-row" id="form" autocomplete="off">
+          <label class="icon-button" for="file" title="Attach files">
+            <input type="file" id="file" multiple hidden />
+            <span aria-hidden="true">+</span>
+          </label>
+          <textarea
+            id="input"
+            class="input"
+            rows="1"
+            placeholder="Message the agent…"
+            disabled
+          ></textarea>
+          <button class="icon-button send" id="send" type="submit" title="Send" disabled>
+            <span aria-hidden="true">&rarr;</span>
+          </button>
+          <button class="icon-button stop" id="stop" type="button" title="Stop" hidden>
+            <span aria-hidden="true">&#9632;</span>
+          </button>
+        </form>
+      </footer>
+    </div>
+    <script src="/agent_page.js"></script>
+  </body>
+</html>
