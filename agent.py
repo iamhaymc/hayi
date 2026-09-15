@@ -3246,10 +3246,10 @@ class WebServer:
     """
 
     ASSETS = {
-        "/": ("agent_page.html", "text/html; charset=utf-8"),
-        "/index.html": ("agent_page.html", "text/html; charset=utf-8"),
-        "/agent_page.css": ("agent_page.css", "text/css; charset=utf-8"),
-        "/agent_page.js": ("agent_page.js", "text/javascript; charset=utf-8"),
+        "/": ("agent_ui.html", "text/html; charset=utf-8"),
+        "/index.html": ("agent_ui.html", "text/html; charset=utf-8"),
+        "/agent_ui.css": ("agent_ui.css", "text/css; charset=utf-8"),
+        "/agent_ui.js": ("agent_ui.js", "text/javascript; charset=utf-8"),
     }
 
     def __init__(

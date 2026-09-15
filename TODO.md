@@ -41,7 +41,7 @@ is recorded here: the reasoning behind what exists is in
 
 - [ ] **Tests for the web layer and the client.** The unit tests stop at the
       protocol codec: the hub handlers, attachment limits, cancellation,
-      reconnection and every line of `agent_page.js` are untested, which is most
+      reconnection and every line of `agent_ui.js` are untested, which is most
       of the surface a user actually touches. Add server tests over a real
       websocket and a browser test that drives the page against a stub agent.
 

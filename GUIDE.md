@@ -16,9 +16,9 @@ is what has been built and why, and [`TODO.md`](TODO.md) is what is left.
 | ----------------- | ----------------------------------------------- |
 | `agent.py`        | The library: every subsystem and the CLI        |
 | `agent_test.py`   | Unit tests                                      |
-| `agent_page.html` | Chat page markup                                |
-| `agent_page.css`  | Mobile first, theme driven styles               |
-| `agent_page.js`   | Client: blocks, markdown, media, commands, hub  |
+| `agent_ui.html` | Chat page markup                                |
+| `agent_ui.css`  | Mobile first, theme driven styles               |
+| `agent_ui.js`   | Client: blocks, markdown, media, commands, hub  |
 | `pyproject.toml`  | Package metadata, dependencies, `agent` script  |
 
 `agent.py` is a single flat module divided by commented section banners, in this
@@ -421,7 +421,7 @@ rather than closing the socket.
 
 | Endpoint         | Response                                    |
 | ---------------- | ------------------------------------------- |
-| `GET /`          | `agent_page.html` (plus `.css`, `.js`)      |
+| `GET /`          | `agent_ui.html` (plus `.css`, `.js`)      |
 | `GET /api/health`| `{ok, name}`                                |
 | `GET /api/config`| The resolved config, secrets masked         |
 | `GET /api/commands` | The command list                         |
@@ -457,7 +457,7 @@ onto the CSS custom properties the page uses, and the result is served at
 
 ## 17. Web client
 
-`agent_page.js` is six small subsystems over one socket:
+`agent_ui.js` is six small subsystems over one socket:
 
 - **Markdown** — escapes the text first (`&`, `<`, `>`, `"`, `'`), then parses
   headings, fences, quotes, rules and lists line by line and applies inline
@@ -484,7 +484,7 @@ onto the CSS custom properties the page uses, and the result is served at
   `history` of the `hello` reply is replayed into the discussion, replacing what
   is shown, so a reload or a reconnect restores the conversation.
 
-`agent_page.css` is mobile first: a `100dvh` grid of header, scrolling discussion
+`agent_ui.css` is mobile first: a `100dvh` grid of header, scrolling discussion
 and composer, centred at `52rem`, with every colour taken from a CSS custom
 property so a theme can replace the palette wholesale. Prompt blocks align right;
 tool and log blocks are monospaced and muted, a tool block keeps its whitespace

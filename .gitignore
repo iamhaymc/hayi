@@ -1,0 +1,24 @@
+# --- build artifacts ---
+build/
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-hf/
+
+# --- Hugging Face download cache ---
+.hf-cache/
+
+# --- editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
