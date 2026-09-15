@@ -1,4 +1,4 @@
-# agent
+# HAYI
 
 An application agnostic agent harness. One class, `Agent`, is the whole API: it
 resolves its own configuration, renders a prompt template the consumer owns,
